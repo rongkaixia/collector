@@ -12,6 +12,7 @@ import MySQLdb
 import json
 import itertools
 from WindPy import w as WindClient
+import numpy as np
 
 # block name in configure file
 MYSQL_SETTING = 'mysql'
@@ -133,9 +134,11 @@ class WindCollector(BaseDayCollector):
             if data.empty:
                 return
             data.columns = result.Fields
-            #特殊逻辑，万德api wsd函数返回的Data没有日期，需要自己引入
+            #特殊逻辑，万德api wsd函数返回的Data没有日期也没有股票代号，需要自己引入
             if tablename == "marketDay":
                 data = data.assign(**{'TIME': np.array(result.Times)[data.index]})
+                data = data.assign(**{'secID':result.Codes[0]})
+                data = data.assign(**{'wind_code':result.Codes[0].split('.')[0]})
             data = self.__FilterData(data, primaryKey)
             if not data.empty and saveToDB:
                 self.saveToMysql(data, db, table)
@@ -159,12 +162,13 @@ class WindCollector(BaseDayCollector):
             errorMessage = 'GetSecIDsError: result code=%d, result msg =%s' %(result.ErrorCode, str(result.Data))
             raise WindApiError(errorMessage)
 
-    def __FilterData(self, data, primaryKey):
+    def __FilterData(self, data, primaryKey = None):
         """ filter data """
         # drop all data if missing primary key
-        for key in primaryKey:
-            if key not in data.columns:
-                return pd.DataFrame()
+        if primaryKey is not None:
+            for key in primaryKey:
+                if key not in data.columns:
+                    return pd.DataFrame()
         # drop duplicate row
         data = data.drop_duplicates()
         # convert string time to datetime
