@@ -119,19 +119,39 @@ class Cleaner():
         anyDiffData = anyDiffData.assign(**{'note':addedColumn})
 
         # 如果有两个信息是一致的，则去掉
-        mostCommIdx = compareData[~idx].apply(lambda x: True if Counter(x).most_common(1)[0][1]>=2 else False, axis=1)
-        oneDiffData = data[~idx][~mostCommIdx]
+        def has_nan(xx):
+            if Counter(xx).most_common(1)[0][1]<2:
+                return False
+            for x in xx:
+                if np.isnan(x):
+                    return True
+            return False
+        # mostCommIdx = compareData[~idx].apply(lambda x: True if Counter(x).most_common(1)[0][1]>=2 else False, axis=1)
+        mostCommIdx = compareData[~idx].apply(has_nan, axis=1)
 
-        #
-        allDiffData = oneDiffData.dropna(axis=0, how='any')
+        allDiffData = data[~idx][~mostCommIdx] #表示三个都不一致，nan != nan
+
+        def has_two(xx):
+            count = 0
+            for x in xx:
+                if not np.isnan(x):
+                    count = count+1;
+            return count>=2
+        twoDiffIdx = compareData[~idx][~mostCommIdx].apply(has_two, axis=1)
+        twoDiffData = allDiffData[twoDiffIdx]
+        oneDiffData = allDiffData[~twoDiffIdx]
+
         print 'same data shape ',
         print sameData.shape
         print 'any diff data shape ',
         print anyDiffData.shape
-        print 'one diff data shape ',
-        print oneDiffData.shape
         print 'all diff data shape ',
         print allDiffData.shape
+        print 'one diff data shape ',
+        print oneDiffData.shape
+        print 'two diff data shape ',
+        print twoDiffData.shape
+        print twoDiffData
 
         # use most common
         return (sameData, anyDiffData, oneDiffData, allDiffData)

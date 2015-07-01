@@ -15,15 +15,20 @@ from pymongo import *
 
 from base_collector import *
 import dfutils
+from bs4 import BeautifulSoup
 
 # http ok code
 HTTP_OK = 200
 
 # block name in configure file
-STOCKIDS_SETTING = 'stockIDs'
-WMCLOUD_SETTING = 'wmcloud'
+WMCLOUD_SETTING = 'exchangeSZ'
+ISSUEIDS_SETTING = 'issueValue'
+
+SZ_DIVIDEND = 'szDividend'
 
 # name to replace in configure file
+REPL_ISSUE_ID = '%{ISSUE_ID}'
+
 REPL_STOCK_ID = '%{STOCK_ID}'
 REPL_BEGIN_DATE = '%{BEGIN_DATE}'
 REPL_END_DATE = '%{END_DATE}'
@@ -72,7 +77,7 @@ class JYCollector(BaseCollector):
             self.dbConnection = MySQLdb.connect(**dbsetting)
         else:
             raise ValueError("'{0}' is not valid for dbtype".format(dbtype))
-        self.httpClient = httplib.HTTPSConnection(self.domain, self.port)
+        self.httpClient = httplib.HTTPConnection(self.domain, self.port)
 
     def __del__( self ):
         if self.httpClient is not None:
@@ -81,6 +86,8 @@ class JYCollector(BaseCollector):
 
     def __encodepath(self, path):
         """encode url"""
+        if path.find('=',0) == -1:
+            return path
         start=0
         n=len(path)
         re=''
@@ -104,9 +111,8 @@ class JYCollector(BaseCollector):
         self.yamlSetting = yaml.safe_load(open(configFile, 'r'))
         self.domain = self.yamlSetting[WMCLOUD_SETTING]['domain']
         self.port = self.yamlSetting[WMCLOUD_SETTING]['port']
-        self.token = self.yamlSetting[WMCLOUD_SETTING]['token']
 
-    def getData(self, path):
+    def getData(self, path, postData=None, headers=None, method='GET'):
         """
         Describe
         ----------
@@ -122,7 +128,6 @@ class JYCollector(BaseCollector):
         result: json type, response data
         """
         result = None
-        path='/data'+path
         path=self.__encodepath(path)
         retry_interval = [0, 1, 2, 4, 8]
         retry_count = 0
@@ -133,7 +138,11 @@ class JYCollector(BaseCollector):
         while True:
             try:
                 #set http header here and make request
-                self.httpClient.request('GET', path, headers = {"Authorization": "Bearer " + self.token})
+                if method == 'POST':
+                    self.httpClient.request('POST', path, postData, headers)
+                else:
+                    print 'path=%s'%(path)
+                    self.httpClient.request('GET', path)
                 response = self.httpClient.getresponse()
                 #read result, parse json into python primitive object
                 result = response.read()
@@ -149,7 +158,6 @@ class JYCollector(BaseCollector):
                     retry_count += 1
 
         # convert string format to json object
-        result = json.loads(result)
         return response.status, result
 
     def httpReconnect(self):
@@ -161,7 +169,7 @@ class JYCollector(BaseCollector):
         if self.httpClient is not None:
             self.httpClient.close()
             self.httpClient = None
-        self.httpClient = httplib.HTTPSConnection(self.domain, self.port)
+        self.httpClient = httplib.HTTPConnection(self.domain, self.port)
 
     def update(self, updateList = None):
         """
@@ -193,28 +201,27 @@ class JYCollector(BaseCollector):
         succList = []
         if updateList is None:
             return (failList,succList)
+        for issueID in self.yamlSetting[ISSUEIDS_SETTING]:
+            tablename = SZ_DIVIDEND
+            print SZ_DIVIDEND
+            # cashDividend and stockDividend
+            data = None
+            try:
+                data = self.fetchData(issueID, SZ_DIVIDEND, '*', '*')
+                if data.empty :
+                    continue
+                dfutils.DfToDatabase(data, SZ_DIVIDEND, self.dbConnection, dbtype=self.dbtype)
+                succList.append([tablename, '*', '*', '*', "OK"])
+            except Exception, e:
+                errorMessage = str(e)
+                failList.append([tablename, '*', '*', '*', errorMessage])
+                print 'update %s in table %s fail: %s' %('*', tablename, errorMessage)
+                print data
+                traceback.print_exc()
+                raise e
+        return (succList, failList)
 
-        if self.stockIDs is None:
-            self.stockIDs = self.getStockIDs()
-
-        for tablename, stockID, beginDate, endDate in updateList:
-            stockList = [stockID]
-            if stockID == "*":
-                stockList = self.stockIDs
-            for sid in stockList:
-                try:
-                    data = self.fetchData(sid, tablename, beginDate, endDate)
-                    if data.empty :
-                        continue
-                    dfutils.DfToDatabase(data, tablename, self.dbConnection, dbtype=self.dbtype)
-                    succList.append([tablename, sid, beginDate, endDate, "OK"])
-                except Exception, e:
-                    errorMessage = str(e)
-                    failList.append([tablename, sid, beginDate, endDate, errorMessage])
-                    print 'update %s in table %s fail: %s' %(sid, tablename, errorMessage)
-        return failList
-
-    def fetchData(self, stockID, tablename, beginDate, endDate):
+    def fetchData(self, issueID, tablename, beginDate, endDate):
         """
         Describe
         ----------
@@ -234,11 +241,13 @@ class JYCollector(BaseCollector):
         pandas.DataFrame
         """
         data = pd.DataFrame()
-        url = self.yamlSetting[tablename]['url']
-        removeSuffix = self.yamlSetting[tablename]['removeSuffix']
-        url = url.replace(REPL_STOCK_ID, (lambda x: x.split('.')[0] if removeSuffix else x)(stockID) )
-        url = url.replace(REPL_BEGIN_DATE, beginDate)
-        url = url.replace(REPL_END_DATE, endDate)
+        postData = self.yamlSetting[tablename]['postData']
+        url = self.yamlSetting[tablename]['postUrl']
+        headers = self.yamlSetting[tablename]['headers']
+        postData = postData.replace(REPL_ISSUE_ID, issueID)
+        print url
+        print postData
+        print headers
 
         primaryKey = None
         renameColumns = None
@@ -247,36 +256,90 @@ class JYCollector(BaseCollector):
         if self.yamlSetting[tablename].has_key('columnMapping'):
             renameColumns = self.yamlSetting[tablename]['columnMapping']
 
+        # 获取报告链接
+        code, result = self.getData(url, postData, headers,method='POST')
+        if code == 403:
+            print 'Error: http return code=%d' %(code)
+            return data
+
+        soup = BeautifulSoup(result)
+        url = None
+        for a_href in soup.find_all('a'):
+            if a_href.string.find(u'分红') !=-1:
+                url = a_href['href']
+                break
+        if url is None:
+            print 'Warning: http dividend url is None'
+            return data
+        print u'分红url=%s'%(url)
+        # 首先返回303， 再获取真实的url
+        code, result = self.getData(url)
+        if code == 403:
+            print 'Error: real url http return code=%d' %(code)
+            raise ValueError
+
+        soup = BeautifulSoup(result)
+        url = None
+        url = soup.find('a')['href']
+        print u'分红 real url=%s'%(url)
+        if url is None:
+            print 'Error: http real dividend url is None'
+            return data
+
+        self.httpClient = httplib.HTTPConnection(self.domain, self.port)
         code, result = self.getData(url)
         if code != HTTP_OK:
             errorMessage = 'http return code=%d' %(code)
             raise WmcloudError(errorMessage)
 
-        # retCode =-1 means no data return
-        if result.has_key('retCode') and result['retCode'] == 1:
-            data = self.FilterData(pd.DataFrame(result['data']), primaryKey, renameColumns)
-        elif result.has_key('retCode') and result['retCode'] == -1:
-            print 'http return code=%d, result code=%d, result msg=%s'%(code, result['retCode'], result['retMsg'])
+        soup = BeautifulSoup(result)
+        if soup.find('tbody') is not None:
+            for row in soup.tbody.find_all('tr'):
+                row_data=[]
+                if len(row.find_all('td')) !=14 or len(row.find_all('td'))!=15:
+                    continue
+                for a in row.find_all('td'):
+                    row_data.append(unicode(a.string))
+                if all([c ==  u'None' for c in row_data]):
+                    print 'WARNING: all None'
+                    continue
+                if len(row_data)>14:
+                    print 'WARNING: len(row_data)=%d'%(len(row_data))
+                    print row_data
+                    row_data=row_data[1:]
+                data=data.append([row_data],ignore_index=True)
         else:
-            errorMessage = 'http return code=%d, result=%s'%(code, str(result))
-            raise WmcloudError(errorMessage)
+            for row in soup.find_all('tr')[1:]:
+                row_data=[]
+                if len(row.find_all('td')) !=14 or len(row.find_all('td'))!=15:
+                    continue
+                for a in row.find_all('td'):
+                    row_data.append(unicode(a.string))
+                if all([c== u'None' for c in row_data]):
+                    print 'WARNING: all None'
+                    continue
+                if len(row_data)>14:
+                    print 'WARNING: len(row_data)=%d'%(len(row_data))
+                    print row_data
+                    row_data=row_data[1:]
+                data=data.append([row_data],ignore_index=True)
+        if data.empty:
+            return data
+        data.columns = ['ticker', 'secName', 'bonus', 'perStockDiv', 'totalCashDiv', 'perCashDiv', 'allotmentNum', 'allotmentRatio', 'allotmentPrice', 'fundsRaised', 'exDivRightsDate', 'regDate', 'exPrice', 'preClosePrice']
+        print data
+        data['perStockDiv'] = data['perStockDiv'].apply(lambda x: float(x) if all(c in "0123456789.+-" for c in x) else np.nan)
+        data['perCashDiv'] = data['perCashDiv'].apply(lambda x: float(x) if all(c in "0123456789.+-" for c in x) else np.nan)
+        data['allotmentRatio'] = data['allotmentRatio'].apply(lambda x: float(x) if all(c in "0123456789.+-" for c in x) else np.nan)
+        data['allotmentPrice'] = data['allotmentPrice'].apply(lambda x: float(x) if all(c in "0123456789.+-" for c in x) else np.nan)
 
         return data
 
     def getStockIDs(self):
         """获取所有股票代码"""
-        secInfo = pd.DataFrame()
-        code, result = self.getData(self.yamlSetting[STOCKIDS_SETTING]['url'])
-        if code != HTTP_OK:
-            errorMessage = 'http return code=%d' %(code)
-            raise WmcloudError(errorMessage)
-
-        if result.has_key('retCode') and result['retCode'] == 1:
-            secInfo = pd.DataFrame(result['data'])
-            return list(self.FilterSecID(secInfo['secID']))
-        else:
-            errorMessage = 'http return code=%d, result=%s'%(code, str(result))
-            raise WmcloudError(errorMessage)
+        stockIDs = []
+        for i in range(600000,605000):
+            stockIDs.append('%06d'%(i))
+        return stockIDs
 
     def FilterData(self, data, primaryKey = None, renameColumns = None):
         """ filter data """
@@ -315,8 +378,8 @@ class JYCollector(BaseCollector):
         return stockIDs
 
 if __name__ == "__main__":
-    s = yaml.safe_load(open('./conf/jy.conf','r'))
-    jy = JYCollector('./conf/jy.conf', dbtype='mongo',database=s['mongo']['db'], **s['mongo']['settings'])
-    updateList=[['marketDay','*','20090101','20101231'],['marketDay','*','20090101','20101231']]
+    s = yaml.safe_load(open('./conf/sz.conf','r'))
+    jy = JYCollector('./conf/sz.conf', dbtype='mongo',database=s['mongo']['db'], **s['mongo']['settings'])
+    updateList=[SZ_DIVIDEND, '*', '0','0']
     s,f = jy.update(updateList)
 
